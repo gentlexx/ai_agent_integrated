@@ -1,210 +1,289 @@
+"""
+统一测试入口
+用法：
+    python test.py                    # 交互式选择测试模块
+    python test.py router             # 直接测试 router
+    python test.py rag                # 直接测试 rag_engine
+    python test.py multi              # 直接测试 multi_agent
+    python test.py agent              # 直接测试 agent_manager
+    python test.py all                # 测试所有模块
+"""
+
+import sys
 import os
-import re
-import numpy as np
-from typing import List, Tuple, Optional
-from langchain_openai import ChatOpenAI
-from langchain_community.document_loaders import DirectoryLoader, TextLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# 尝试导入 BM25 相关库
-try:
-    from rank_bm25 import BM25Okapi
-    BM25_AVAILABLE = True
-except ImportError:
-    BM25_AVAILABLE = False
-    print("<router-warn> rank_bm25 未安装，混合检索不可用，请执行: pip install rank_bm25")
-
-class Router:
-    def __init__(self, llm=None, knowledge_path: str = None):
-        """
-        动态路由器：根据知识库实际内容判断路由
-
-        Args:
-            llm: 语言模型
-            knowledge_path: 知识库文件夹路径
-        """
-        self.llm = llm
-
-        # 设置知识库路径
-        if knowledge_path is None:
-            current_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            knowledge_path = os.path.join(current_dir, "knowledge_base")
-        self.knowledge_path = knowledge_path
-
-        # 初始化 ZhiPuZAIEmbedding（用于语义搜索）
-        try:
-            from langchain_community.embeddings import ZhipuAIEmbeddings
-            from src.config import get_api_key
-            self.embeddings = ZhipuAIEmbeddings(
-                api_key=get_api_key(),
-                model="embedding-2"
-            )
-            self.use_embedding = True
-            print("<路由器>：Embedding 已初始化")
-        except Exception as e:
-            print(f"<路由器>：Embedding 初始化失败 {e}，将使用 LLM 判断")
-            self.use_embedding = False
+# 添加项目根目录到路径
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 
-        # 动态加载知识库摘要
-        self.kb_summary = self._load_kb_summary()
+def print_separator(title: str):
+    """打印分隔线"""
+    print("\n" + "=" * 60)
+    print(f"  {title}")
+    print("=" * 60)
 
-        # 缓存知识库向量（用于快速相似度匹配）
-        self.kb_vectors: Optional[List] = None  # 👈 使用 List 类型提示
-        self.kb_chunks: Optional[List] = None
-        if self.use_embedding:
-            self._cache_kb_vectors()
 
-    def _load_kb_summary(self) -> str:
-        """加载知识库内容摘要"""
-        if not os.path.exists(self.knowledge_path):
-            return "暂无知识库内容"
+def test_router():
+    """测试路由器"""
+    print_separator("测试 Router")
 
-        all_content = []
-        try:
-            loader = DirectoryLoader(
-                self.knowledge_path,
-                glob="**/*.txt",
-                loader_cls=TextLoader,
-                loader_kwargs={"encoding": "utf-8"},
-                silent_errors=True,
-            )
-            docs_summary = loader.load()
+    from src.config import get_model_config
+    from langchain_openai import ChatOpenAI
+    from src.router import Router
 
-            for doc in docs_summary:
-                # 提取文件名和内容预览
-                filename = os.path.basename(doc.metadata.get('source', ''))
-                content_preview = doc.page_content[:500]  # 只取前500字
-                all_content.append(f"【文件：{filename}】\n{content_preview}")
-        except Exception as e:
-            print(f"加载知识库失败: {e}")
+    # 初始化
+    llm_config = get_model_config()
+    llm = ChatOpenAI(**llm_config)
+    router = Router(llm=llm)
 
-        if not all_content:
-            return "暂无知识库内容"
+    print("\n【测试1】强制RAG关键词匹配")
+    test_questions = [
+        "在知识库中查找项目管理制度",
+        "文件中有哪些政策",
+        "rag 查询产品信息",
+        "今天天气怎么样",
+        "帮我记个笔记"
+    ]
 
-        return "\n\n".join(all_content)
+    for q in test_questions:
+        result = router.route(q)
+        force_check = router.force_rag_check(q)
+        print(f"  问题: {q}")
+        print(f"    强制RAG: {force_check}, 路由结果: {result}")
 
-    def _cache_kb_vectors(self):
-        """缓存知识库所有文档的向量"""
-        if not self.use_embedding:
-            return
+    print("\n【测试2】混合检索得分")
+    if router.kb_vectors:
+        score, content = router.hybrid_search("项目管理")
+        print(f"  查询: 项目管理")
+        print(f"    混合得分: {score:.3f}")
+        if content:
+            print(f"    匹配内容: {content[:100]}...")
+    else:
+        print("  知识库为空，跳过混合检索测试")
 
-        try:
-            loader = DirectoryLoader(
-                self.knowledge_path,
-                glob="**/*.txt",
-                loader_cls=TextLoader,
-                loader_kwargs={"encoding": "utf-8"},
-                silent_errors=True,
-            )
-            cache_docs = loader.load()
+    print("\n【测试3】路由决策")
+    test_q = "公司加班政策是什么"
+    result = router.route(test_q)
+    print(f"  问题: {test_q}")
+    print(f"  决策: {result}")
 
-            if not cache_docs:
-                print("<!路由器>：知识库为空")
-                return
 
-            # 分块处理
-            splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-            self.kb_chunks = splitter.split_documents(cache_docs)
+def test_rag():
+    """测试RAG引擎"""
+    print_separator("测试 RAGEngine")
 
-            # 计算所有块的向量
-            texts = [chunk.page_content for chunk in self.kb_chunks]
-            self.kb_vectors = self.embeddings.embed_documents(texts)
+    from src.config import get_model_config
+    from langchain_openai import ChatOpenAI
+    from src.rag_engine import RAGEngine
 
-            print(f"<路由器>：已缓存 {len(self.kb_vectors)} 个知识块向量")
-        except Exception as e:
-            print(f"<!路由器>：向量缓存失败 {e}")
+    # 初始化
+    llm_config = get_model_config()
+    llm = ChatOpenAI(**llm_config)
+    rag = RAGEngine(llm)
 
-    def reload(self):
-        """重新加载知识库（上传新文件后调用）"""
-        print("🔄<路由器>：重新加载知识库...")
-        self.kb_summary = self._load_kb_summary()
-        if self.use_embedding:
-            self._cache_kb_vectors()
-        print("<路由器>：知识库已更新")
+    if rag.is_empty():
+        print("⚠️ 知识库为空，请先在 knowledge_base 目录下添加文件")
+        return
 
-    def semantic_similarity_route(self, question: str, threshold: float = 0.5) -> Tuple[bool, float]:
-        """
-        使用语义相似度判断：问题是否与知识库内容相关
+    print("\n【测试1】直接检索（ask_direct）")
+    test_q = "项目管理制度"
+    result = rag.ask_direct(test_q)
+    if result:
+        print(f"  问题: {test_q}")
+        print(f"  返回类型: {type(result).__name__}")
+        print(f"  内容预览: {result[:200]}...")
+    else:
+        print(f"  未找到相关内容")
 
-        Returns:
-            (是否走RAG, 最高相似度)
-        """
-        if not self.use_embedding or self.kb_vectors is None or len(self.kb_vectors) == 0:
-            return None, 0.0
+    print("\n【测试2】返回多条原文（ask_direct k=3）")
+    results = rag.ask_direct(test_q, k=3)
+    if results:
+        print(f"  返回 {len(results)} 条原文")
+        for i, r in enumerate(results):
+            print(f"    第{i + 1}条: {r[:80]}...")
 
-        try:
-            # 计算问题的向量
-            question_vector = self.embeddings.embed_query(question)
+    print("\n【测试3】LLM改写（ask）")
+    result = rag.ask(test_q)
+    if result:
+        print(f"  问题: {test_q}")
+        print(f"  LLM回答: {result}")
 
-            # 计算与所有知识块的最大相似度
-            similarities = []
-            for kb_vector in self.kb_vectors:
-                sim = self._cosine_similarity(question_vector, kb_vector)
-                similarities.append(sim)
+    print("\n【测试4】对比原文 vs 改写")
+    original = rag.ask_direct(test_q)
+    rewritten = rag.ask(test_q)
+    print(f"  原文长度: {len(original) if original else 0} 字符")
+    print(f"  改写长度: {len(rewritten) if rewritten else 0} 字符")
 
-            max_sim = max(similarities)
-            is_rag = max_sim >= threshold
 
-            print(f"<语义路由> 最高相似度: {max_sim:.3f}, 阈值: {threshold}, 走RAG: {is_rag}")
-            return is_rag, max_sim
+def test_multi():
+    """测试多智能体系统"""
+    print_separator("测试 MultiAgentSystem")
 
-        except Exception as e:
-            print(f"<语义路由> 错误: {e}")
-            return None, 0.0
+    from src.multi_agent import MultiAgentSystem
 
-    def _cosine_similarity(self, a, b):
-        """计算余弦相似度"""
-        a = np.array(a)
-        b = np.array(b)
-        return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+    system = MultiAgentSystem()
 
-    def llm_route(self, question: str) -> str:
-        """使用 LLM 判断：问题是否能在知识库中找到答案"""
-        prompt = f"""判断用户问题是否可以通过以下知识库回答。
+    print("\n【测试1】强制RAG触发")
+    result = system.run("在知识库中查找项目管理制度")
+    print(f"  最终答案: {result['final_answer'][:200]}...")
+    print(f"\n  思考过程关键步骤:")
+    for line in result['process'].split('\n'):
+        if any(x in line for x in ['判断', '规划决策', '强制', '执行']):
+            print(f"    {line}")
 
-## 知识库内容
-{self.kb_summary[:2000]}
+    print("\n【测试2】多轮对话记忆")
+    system.run("我叫张三")
+    result = system.run("我叫什么名字")
+    print(f"  问题: 我叫什么名字")
+    print(f"  回答: {result['final_answer']}")
+    if "张三" in result['final_answer']:
+        print("  ✅ 记忆功能正常")
+    else:
+        print("  ❌ 记忆功能异常")
 
-## 用户问题
-{question}
+    print("\n【测试3】历史关联判断")
+    system.run("我喜欢吃西瓜")
+    result = system.run("它甜吗")
+    print(f"  问题: 它甜吗")
+    print(f"  回答: {result['final_answer']}")
+    # 检查思考过程是否包含关联判断
+    if "判断" in result['process']:
+        print("  ✅ 历史关联判断已执行")
+    else:
+        print("  ⚠️ 未检测到历史关联判断")
 
-## 判断规则
-- 如果知识库中包含回答该问题所需的信息，输出：rag
-- 如果知识库中没有相关信息，输出：agent
+    print("\n【测试4】查看完整思考过程")
+    result = system.run("你好")
+    print(f"  过程:\n{result['process']}")
 
-## 注意
-- 只输出 rag 或 agent，不要有其他内容
-- 如果知识库为空，输出 agent
 
-输出："""
+def test_agent():
+    """测试Agent管理器"""
+    print_separator("测试 AgentManager")
 
-        try:
-            response = self.llm.invoke(prompt)
-            decision = response.content.strip().lower()
-            print(f"<LLM路由> 决策: {decision}")
-            return "rag" if decision == "rag" else "agent"
-        except Exception as e:
-            print(f"<LLM路由> 错误: {e}")
-            return "agent"  # 默认走 agent
+    from src.config import get_model_config
+    from langchain_openai import ChatOpenAI
+    from src.agent_manager import AgentManager
 
-    def route(self, question: str) -> str:
-        """
-        智能路由决策（优先使用语义相似度）
+    # 初始化
+    llm_config = get_model_config()
+    llm = ChatOpenAI(**llm_config)
+    agent = AgentManager(llm)
 
-        优先级：
-        1. 语义相似度（快但可能有误差）
-        2. LLM 判断（准但稍慢）
-        """
-        # 先用语义相似度快速判断
-        is_rag, similarity = self.semantic_similarity_route(question, threshold=0.25)
+    print("\n【测试1】基础问答")
+    test_q = "你好，介绍一下你自己"
+    result = agent.ask(test_q)
+    print(f"  问题: {test_q}")
+    print(f"  回答: {result[:150]}...")
 
-        if is_rag is not None:
-            if similarity > 0.25:
-                return "rag"
-            elif similarity < 0.1:
-                return "agent"
-            # 相似度在中间范围，用 LLM 确认
+    print("\n【测试2】工具调用 - 天气")
+    test_q = "北京今天天气怎么样"
+    result = agent.ask(test_q)
+    print(f"  问题: {test_q}")
+    print(f"  回答: {result[:150]}...")
 
-        # 使用 LLM 判断
-        return self.llm_route(question)
+    print("\n【测试3】工具调用 - 时间")
+    test_q = "现在几点了"
+    result = agent.ask(test_q)
+    print(f"  问题: {test_q}")
+    print(f"  回答: {result}")
+
+
+def test_all():
+    """测试所有模块"""
+    print_separator("测试所有模块")
+
+    test_router()
+    test_rag()
+    test_agent()
+    test_multi()
+
+
+def interactive_mode():
+    """交互式选择测试模块"""
+    print_separator("统一测试入口")
+    print("\n可选测试模块:")
+    print("  1. router     - 路由器（混合检索、路由决策）")
+    print("  2. rag        - RAG引擎（知识库检索）")
+    print("  3. multi      - 多智能体系统（完整流程）")
+    print("  4. agent      - Agent管理器（工具调用）")
+    print("  5. all        - 测试所有模块")
+    print("  6. quick      - 快速测试（预设用例）")
+    print("  0. exit       - 退出")
+
+    choice = input("\n请输入序号或模块名: ").strip().lower()
+
+    if choice in ["1", "router"]:
+        test_router()
+    elif choice in ["2", "rag"]:
+        test_rag()
+    elif choice in ["3", "multi"]:
+        test_multi()
+    elif choice in ["4", "agent"]:
+        test_agent()
+    elif choice in ["5", "all"]:
+        test_all()
+    elif choice in ["6", "quick"]:
+        quick_test()
+    elif choice in ["0", "exit"]:
+        print("退出测试")
+        return
+    else:
+        print(f"未知选项: {choice}")
+        interactive_mode()
+        return
+
+    # 测试完成后询问是否继续
+    again = input("\n是否继续测试其他模块？(y/n): ").strip().lower()
+    if again == "y":
+        interactive_mode()
+
+
+def quick_test():
+    """快速测试（预设用例）"""
+    print_separator("快速测试")
+
+    from src.multi_agent import MultiAgentSystem
+
+    system = MultiAgentSystem()
+
+    print("\n【快速测试用例】")
+    test_cases = [
+        ("强制RAG", "在知识库中查找公司政策"),
+        ("记忆测试", "我叫李四"),
+        ("记忆回忆", "我叫什么名字"),
+        ("历史关联", "它好吃吗"),
+        ("简单问候", "你好"),
+    ]
+
+    for name, question in test_cases:
+        print(f"\n--- {name} ---")
+        print(f"用户: {question}")
+        result = system.run(question)
+        print(f"助手: {result['final_answer'][:100]}")
+        # 打印关键过程
+        for line in result['process'].split('\n'):
+            if any(x in line for x in ['判断', '规划决策', '强制']):
+                print(f"  {line}")
+
+
+if __name__ == "__main__":
+    # 命令行参数模式
+    if len(sys.argv) > 1:
+        arg = sys.argv[1].lower()
+        if arg == "router":
+            test_router()
+        elif arg == "rag":
+            test_rag()
+        elif arg == "multi":
+            test_multi()
+        elif arg == "agent":
+            test_agent()
+        elif arg == "all":
+            test_all()
+        else:
+            print(f"未知参数: {arg}")
+            print("用法: python test.py [router|rag|multi|agent|all]")
+    else:
+        # 交互式模式
+        interactive_mode()

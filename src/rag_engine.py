@@ -1,5 +1,5 @@
 import os
-from typing import List, Optional
+from typing import List, Optional, Union
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.document_loaders import DirectoryLoader, TextLoader
@@ -46,7 +46,7 @@ class RAGEngine:
                                   "models", "text2vec-base-chinese")
 
         if not os.path.exists(model_path):
-            raise RuntimeError(f"!!!hf本地模型不存在: {model_path}")
+            raise RuntimeError(f"(rag-error) 本地模型不存在: {model_path}")
 
         os.environ['HF_HUB_OFFLINE'] = '1'
         os.environ['TRANSFORMERS_OFFLINE'] = '1'
@@ -82,6 +82,8 @@ class RAGEngine:
         def format_docs(docs):
             return "\n\n".join(d.page_content for d in docs)
 
+        print(f"(rag-init) 知识库构建完成，共 {len(chunks)} 个文本块")
+
         return (
                 {"context": self.retriever | format_docs, "question": RunnablePassthrough()}
                 | prompt
@@ -90,24 +92,53 @@ class RAGEngine:
         )
 
     def ask(self, question: str) -> Optional[str]:
-        """使用 LLM 生成回答"""
+        """使用 LLM 生成回答（会改写原文）"""
         if self.chain is None:
+            print("(rag-warn) 知识库为空，无法回答")
             return None
-        return self.chain.invoke(question)
 
-    def ask_direct(self, question: str) -> Optional[str]:
-        """直接返回检索到的原文（不经过 LLM）"""
+        print(f"(rag-ask) 问题: {question[:50]}...")
+        result = self.chain.invoke(question)
+        print(f"(rag-ask) 回答: {result[:100]}...")
+        return result
+
+    def ask_direct(self, question: str, k: int = 1) -> Optional[Union[str, List[str]]]:
+        """
+        直接返回检索到的原文（不经过 LLM）
+
+        用于强制 RAG 场景：只返回知识库原文，不让模型改写
+
+        Args:
+            question: 查询问题
+            k: 返回文档数量
+               - k=1（默认）：返回单条原文（字符串）
+               - k>1：返回多条原文（列表）
+
+        Returns:
+            k=1 时返回字符串，k>1 时返回字符串列表，无结果时返回 None
+        """
         if self.retriever is None:
+            print("(rag-warn) 检索器未初始化，无法直接检索")
             return None
 
         try:
             docs = self.retriever.invoke(question)
-            if docs:
-                return docs[0].page_content
-            return None
+            if not docs:
+                print("(rag-warn) 未找到相关文档")
+                return None
+
+            if k == 1:
+                result = docs[0].page_content
+                print(f"(rag-direct) 直接检索成功，返回原文 {len(result)} 字符")
+                print(f"(rag-direct) 内容预览: {result[:100]}...")
+                return result
+            else:
+                results = [doc.page_content for doc in docs[:k]]
+                print(f"(rag-direct) 直接检索成功，返回 {len(results)} 条原文")
+                return results
         except Exception as e:
-            print(f"[RAG直接检索] 错误: {e}")
-            return self.ask(question)
+            print(f"(rag-error) 直接检索失败: {e}")
+            return None
 
     def is_empty(self) -> bool:
         """检查知识库是否为空"""
@@ -115,10 +146,14 @@ class RAGEngine:
 
     def reload(self):
         """重新加载知识库"""
-        print("🔄 RAG: 重新加载知识库...")
+        print("(rag-reload) 重新加载知识库...")
         self.chain = self._build_chain()
         if self.chain:
-            print("✅ RAG: 知识库已更新")
+            print("(rag-reload) 知识库已更新")
         else:
-            print("❌ RAG: 知识库为空")
+            print("(rag-reload) 知识库为空")
         return self.chain
+
+    def get_retriever(self):
+        """获取检索器（用于调试）"""
+        return self.retriever
